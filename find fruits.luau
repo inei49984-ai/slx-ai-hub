@@ -1,28 +1,39 @@
--- Lua | fruit_hop.lua | Roblox executor (needs queue_on_teleport, firetouchinterest; writefile/readfile for saved settings) | target: Blox Fruits (assumed)
--- Standalone: paste or execute this one file. It re-queues its own source across server hops, no extra files needed.
+-- Lua | fruit_hop.lua | Roblox executor (needs firetouchinterest; writefile/readfile for saved settings) | target: Blox Fruits (assumed)
+-- Standalone single file. Put it in your executor's autoexec folder and it starts by itself in every server.
 
-local SOURCE = [====[
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
+-- autoexec can run before the client is ready: wait for the game and for LocalPlayer
+if not game:IsLoaded() then game.Loaded:Wait() end
 local player = Players.LocalPlayer
+while not player do
+    task.wait(0.1)
+    player = Players.LocalPlayer
+end
+
+-- never run twice in the same server (autoexec + manual execute)
+local env = (getgenv and getgenv()) or _G
+if env.FruitHopServer == game.JobId then return end
+env.FruitHopServer = game.JobId
 
 -- runtime values; every one of these is driven from the UI and saved by WindUI's config
 local settings = {
     farm = true,
     team = "Marines",
     speed = 200,
-    hop_mode = "empty",
-    min_players = 0,
-    max_players = 0,       -- 0 = server cap - 1
-    region = "",           -- "" = any
-    retries = 3,
-    hop_delay = 2,
     esp = true,
     notify = true,
     auto_store = true,
+    hotkey = "RightControl",
 }
+
+local HOLD_SECONDS = 1     -- time spent touching each fruit
+local MAX_ATTEMPTS = 5     -- failed tries in a row (with no pickup anywhere) before a fruit is skipped
+local HOP_RETRIES = 3
+local HOP_DELAY = 2
 
 -- UI library (if it fails to load the farm still runs on the defaults above)
 local lib_ok, WindUI = pcall(function()
@@ -45,10 +56,22 @@ local function get_comm()
     return remotes and remotes:FindFirstChild("CommF_")
 end
 
--- 1. join team: spam the remote until player.Team is set
+local function get_root_now()
+    local char = player.Character
+    return char and char:FindFirstChild("HumanoidRootPart")
+end
+
+local function get_root()
+    local char = player.Character or player.CharacterAdded:Wait()
+    return char:WaitForChild("HumanoidRootPart", 15)
+end
+
+-- 1. join team: spam the remote until player.Team is set (a manual join also ends the loop)
 local function join_team()
     if player.Team ~= nil then return end
-    local comm = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("CommF_")
+    local remotes = ReplicatedStorage:WaitForChild("Remotes", 15)
+    local comm = remotes and remotes:WaitForChild("CommF_", 15)
+    if not comm then return end
     notify("Team", "Joining " .. settings.team)
     while player.Team == nil do
         pcall(function()
@@ -59,12 +82,7 @@ local function join_team()
     notify("Team", "Joined " .. tostring(player.Team))
 end
 
--- 2. movement: per-frame mover at settings.speed studs/sec, noclip while moving
-local function get_root()
-    local char = player.Character or player.CharacterAdded:Wait()
-    return char:WaitForChild("HumanoidRootPart")
-end
-
+-- 2. noclip while moving
 local noclip_conn = nil
 local noclip_saved = {}
 
@@ -93,31 +111,7 @@ local function set_noclip(state)
     end
 end
 
-local function move_to(target_cf)
-    local root = get_root()
-    local target = target_cf.Position
-    while true do
-        local dt = RunService.Heartbeat:Wait()
-        if not root.Parent then return end
-        local offset = target - root.Position
-        local dist = offset.Magnitude
-        local step = settings.speed * dt
-        root.AssemblyLinearVelocity = Vector3.zero
-        if dist <= step then
-            root.CFrame = CFrame.new(target)
-            return
-        end
-        root.CFrame = root.CFrame.Rotation + root.Position + offset.Unit * step
-    end
-end
-
-local function tween_to(target_cf)
-    set_noclip(true)
-    pcall(move_to, target_cf)
-    set_noclip(false)
-end
-
--- 3. fruits: find, collect, store
+-- 3. fruits: find, move to, hold contact, store
 local function find_fruits()
     local found = {}
     for _, obj in ipairs(workspace:GetChildren()) do
@@ -128,44 +122,149 @@ local function find_fruits()
     return found
 end
 
-local function store_fruits()
-    if not settings.auto_store then return end
-    local comm = get_comm()
-    if not comm then return end
-    for _, container in ipairs({ player.Backpack, player.Character }) do
+local function held_fruits()
+    local list = {}
+    for _, container in ipairs({ player:FindFirstChild("Backpack"), player.Character }) do
         if container then
             for _, tool in ipairs(container:GetChildren()) do
                 if tool:IsA("Tool") and tool.Name:lower():find("fruit") then
-                    local name = tool:GetAttribute("OriginalName") or tool.Name
-                    local ok = pcall(function()
-                        return comm:InvokeServer("StoreFruit", name, tool)
-                    end)
-                    notify("Storage", (ok and "Stored " or "Failed to store ") .. tool.Name)
+                    table.insert(list, tool)
                 end
             end
+        end
+    end
+    return list
+end
+
+-- returns true when nothing is left in the inventory (or auto store is off)
+local storing = false
+local function store_fruits()
+    if not settings.auto_store then return true end
+    local comm = get_comm()
+    if not comm then return false end
+    while storing do task.wait(0.1) end
+    storing = true
+    pcall(function()
+        for _ = 1, 3 do
+            local list = held_fruits()
+            if #list == 0 then break end
+            for _, tool in ipairs(list) do
+                local name = tool:GetAttribute("OriginalName") or tool.Name
+                pcall(function() return comm:InvokeServer("StoreFruit", name, tool) end)
+                task.wait(0.25)
+                if tool.Parent == nil then
+                    notify("Storage", "Stored " .. name)
+                end
+            end
+            task.wait(0.3)
+        end
+    end)
+    storing = false
+    return #held_fruits() == 0
+end
+
+-- keeps storing in the background so a fruit never sits in the inventory
+task.spawn(function()
+    while true do
+        if settings.auto_store and #held_fruits() > 0 then
+            pcall(store_fruits)
+        end
+        task.wait(2)
+    end
+end)
+
+-- moves toward the fruit's current position every frame (so shifted fruits are tracked)
+local function move_to(fruit, handle)
+    local started = os.clock()
+    while fruit.Parent == workspace and handle.Parent do
+        if os.clock() - started > 60 then return false end
+        local dt = RunService.Heartbeat:Wait()
+        local root = get_root_now()
+        if not root then return false end
+        local offset = handle.Position - root.Position
+        local dist = offset.Magnitude
+        local step = settings.speed * dt
+        root.AssemblyLinearVelocity = Vector3.zero
+        if dist <= step then
+            root.CFrame = handle.CFrame
+            return true
+        end
+        root.CFrame = root.CFrame.Rotation + root.Position + offset.Unit * step
+    end
+    return false
+end
+
+-- stays on the fruit for `duration` seconds, touching it every frame
+local function hold_contact(fruit, handle, duration)
+    local started = os.clock()
+    while os.clock() - started < duration do
+        if fruit.Parent ~= workspace or not handle.Parent then return end
+        RunService.Heartbeat:Wait()
+        local root = get_root_now()
+        if not root then return end
+        root.CFrame = handle.CFrame
+        root.AssemblyLinearVelocity = Vector3.zero
+        if firetouchinterest then
+            firetouchinterest(root, handle, 0)
+            firetouchinterest(root, handle, 1)
         end
     end
 end
 
 local function collect_fruit(fruit)
     local handle = fruit:FindFirstChild("Handle")
-    if not handle then return end
-    local root = get_root()
-    local dist = math.floor((root.Position - handle.Position).Magnitude)
-    notify("Moving", ("%s (%d studs)"):format(fruit.Name, dist))
-    tween_to(handle.CFrame)
-    if firetouchinterest then
-        local r = get_root()
-        firetouchinterest(r, handle, 0)
-        task.wait()
-        firetouchinterest(r, handle, 1)
-    end
-    task.wait(0.5)
-    notify("Collected", fruit.Name)
-    store_fruits()
+    if not handle then return false end
+    set_noclip(true)
+    pcall(function()
+        if move_to(fruit, handle) then
+            hold_contact(fruit, handle, HOLD_SECONDS)
+        end
+    end)
+    set_noclip(false)
+    return fruit.Parent ~= workspace
 end
 
--- 4. server-side hop via the in-game server browser (client TeleportService returns Unauthorized here)
+-- re-scans the map after every pickup, always goes for the nearest remaining fruit
+local function farm_server()
+    local attempts = {}
+    while settings.farm do
+        local root = get_root_now()
+        if not root then
+            task.wait(0.5)
+            root = get_root()
+            if not root then return end
+        end
+
+        local nearest, nearest_dist = nil, math.huge
+        for _, fruit in ipairs(find_fruits()) do
+            if (attempts[fruit] or 0) < MAX_ATTEMPTS then
+                local dist = (fruit.Handle.Position - root.Position).Magnitude
+                if dist < nearest_dist then
+                    nearest, nearest_dist = fruit, dist
+                end
+            end
+        end
+
+        if not nearest then
+            notify("Farm", "No fruits left in this server")
+            return
+        end
+
+        attempts[nearest] = (attempts[nearest] or 0) + 1
+        notify("Moving", ("%s (%d studs)"):format(nearest.Name, math.floor(nearest_dist)))
+        local got = collect_fruit(nearest)
+        if got then
+            notify("Collected", nearest.Name)
+            -- any pickup is progress (piles drop one fruit at a time), so every fruit gets fresh tries
+            attempts = {}
+        end
+
+        -- storing runs on its own and never gates the loop; the hop happens only when no fruit is left
+        task.spawn(store_fruits)
+    end
+end
+
+-- 4. random server hop through the in-game server browser (client TeleportService returns Unauthorized here)
 local function fetch_servers(browser)
     local deadline = os.clock() + 30
     for i = 1, 100 do
@@ -183,58 +282,43 @@ local function fetch_servers(browser)
     return nil
 end
 
-local function pick_targets(list, my_job)
-    local max_p = Players.MaxPlayers
-    local cap = settings.max_players > 0 and settings.max_players or (max_p - 1)
-    local region_filter = settings.region ~= "" and settings.region:lower() or nil
-    local cands = {}
-    for job, info in pairs(list) do
-        if job ~= my_job and type(info) == "table" then
-            local count = tonumber(info.Count) or math.huge
-            local region = tostring(info.Region or ""):lower()
-            local region_ok = region_filter == nil or region:find(region_filter, 1, true) ~= nil
-            if region_ok and count >= settings.min_players and count <= cap and count < max_p then
-                table.insert(cands, { job = job, count = count })
-            end
-        end
-    end
-    if settings.hop_mode == "populated" then
-        table.sort(cands, function(a, b) return a.count > b.count end)
-    elseif settings.hop_mode == "random" then
-        for i = #cands, 2, -1 do
-            local j = math.random(i)
-            cands[i], cands[j] = cands[j], cands[i]
-        end
-    else
-        table.sort(cands, function(a, b) return a.count < b.count end)
-    end
-    return cands
-end
-
 local function hop()
     local browser = ReplicatedStorage:WaitForChild("__ServerBrowser", 10)
     if not browser then
         notify("Hop", "Server browser not found")
-        task.wait(settings.hop_delay)
+        task.wait(HOP_DELAY)
         return
     end
 
-    for attempt = 1, settings.retries do
-        notify("Hop", ("Fetching servers (%d/%d)"):format(attempt, settings.retries))
+    for attempt = 1, HOP_RETRIES do
+        notify("Hop", ("Fetching servers (%d/%d)"):format(attempt, HOP_RETRIES))
         local ok, my_job = pcall(function() return browser:InvokeServer("getjob") end)
+        my_job = ok and my_job or game.JobId
         local list = fetch_servers(browser)
         if list then
-            local cands = pick_targets(list, ok and my_job or game.JobId)
+            local cands = {}
+            for job, info in pairs(list) do
+                if job ~= my_job and type(info) == "table" then
+                    local count = tonumber(info.Count) or math.huge
+                    if count < Players.MaxPlayers then
+                        table.insert(cands, { job = job, count = count })
+                    end
+                end
+            end
+            for i = #cands, 2, -1 do
+                local j = math.random(i)
+                cands[i], cands[j] = cands[j], cands[i]
+            end
             notify("Hop", ("%d candidate servers"):format(#cands))
             for _, c in ipairs(cands) do
                 notify("Hop", ("Teleporting (%d players)"):format(c.count))
                 pcall(function() browser:InvokeServer("teleport", c.job) end)
-                task.wait(5)  -- still here = that job refused, try next
+                task.wait(5)  -- still here = that job refused, try the next one
             end
         else
             notify("Hop", "Server list unavailable")
         end
-        task.wait(settings.hop_delay)
+        task.wait(HOP_DELAY)
     end
 end
 
@@ -287,27 +371,29 @@ end
 
 task.spawn(function()
     while true do
-        if settings.esp then
-            local live = {}
-            local root = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
-            for _, fruit in ipairs(find_fruits()) do
-                live[fruit] = true
-                if not esp_objects[fruit] then
-                    esp_objects[fruit] = make_esp(fruit)
+        pcall(function()
+            if settings.esp then
+                local live = {}
+                local root = get_root_now()
+                for _, fruit in ipairs(find_fruits()) do
+                    live[fruit] = true
+                    if not esp_objects[fruit] then
+                        esp_objects[fruit] = make_esp(fruit)
+                    end
+                    local o = esp_objects[fruit]
+                    if o and root and o.handle and o.handle.Parent then
+                        local dist = math.floor((root.Position - o.handle.Position).Magnitude)
+                        o.label.Text = ("%s [%dm]"):format(fruit.Name, dist)
+                    end
                 end
-                local o = esp_objects[fruit]
-                if o and root and o.handle.Parent then
-                    local dist = math.floor((root.Position - o.handle.Position).Magnitude)
-                    o.label.Text = ("%s [%dm]"):format(fruit.Name, dist)
+                for fruit, o in pairs(esp_objects) do
+                    if not live[fruit] or not fruit.Parent then
+                        destroy_esp(o)
+                        esp_objects[fruit] = nil
+                    end
                 end
             end
-            for fruit, o in pairs(esp_objects) do
-                if not live[fruit] or not fruit.Parent then
-                    destroy_esp(o)
-                    esp_objects[fruit] = nil
-                end
-            end
-        end
+        end)
         task.wait(0.25)
     end
 end)
@@ -318,9 +404,32 @@ if WindUI then
         Title = "Fruit Hop",
         Author = "Blox Fruits",
         Folder = "FruitHop",
-        Size = UDim2.fromOffset(560, 420),
+        Size = UDim2.fromOffset(560, 380),
         Theme = "Dark",
+        ToggleKey = Enum.KeyCode.RightControl,
     })
+
+    -- hotkey that reopens the window after it was minimized with "-"
+    local hotkey_native = pcall(function()
+        window:SetToggleKey(Enum.KeyCode.RightControl)
+    end)
+    local current_key = Enum.KeyCode.RightControl
+
+    local function apply_hotkey(name)
+        local ok, key = pcall(function() return Enum.KeyCode[name] end)
+        if not ok or not key then return end
+        current_key = key
+        if hotkey_native then
+            pcall(function() window:SetToggleKey(key) end)
+        end
+    end
+
+    if not hotkey_native then
+        UserInputService.InputBegan:Connect(function(input, processed)
+            if processed or input.KeyCode ~= current_key then return end
+            pcall(function() window:Toggle() end)
+        end)
+    end
 
     local config = nil
     pcall(function()
@@ -372,44 +481,6 @@ if WindUI then
         Callback = function(v) settings.auto_store = v save_config() end,
     }))
 
-    local hop_tab = window:Tab({ Title = "Server Hop", Icon = "globe" })
-    reg("HopMode", hop_tab:Dropdown({
-        Title = "Hop Mode",
-        Values = { "empty", "populated", "random" },
-        Value = settings.hop_mode,
-        Callback = function(opt) settings.hop_mode = option_value(opt) save_config() end,
-    }))
-    reg("MinPlayers", hop_tab:Slider({
-        Title = "Min Players",
-        Value = { Min = 0, Max = 11, Default = settings.min_players },
-        Step = 1,
-        Callback = function(v) settings.min_players = v save_config() end,
-    }))
-    reg("MaxPlayers", hop_tab:Slider({
-        Title = "Max Players (0 = auto)",
-        Value = { Min = 0, Max = 12, Default = settings.max_players },
-        Step = 1,
-        Callback = function(v) settings.max_players = v save_config() end,
-    }))
-    reg("Region", hop_tab:Input({
-        Title = "Region (blank = any)",
-        Placeholder = "singapore",
-        Value = settings.region,
-        Callback = function(text) settings.region = tostring(text or "") save_config() end,
-    }))
-    reg("Retries", hop_tab:Slider({
-        Title = "Retries",
-        Value = { Min = 1, Max = 10, Default = settings.retries },
-        Step = 1,
-        Callback = function(v) settings.retries = v save_config() end,
-    }))
-    reg("HopDelay", hop_tab:Slider({
-        Title = "Hop Delay (s)",
-        Value = { Min = 1, Max = 10, Default = settings.hop_delay },
-        Step = 1,
-        Callback = function(v) settings.hop_delay = v save_config() end,
-    }))
-
     local visual_tab = window:Tab({ Title = "Visuals", Icon = "eye" })
     reg("FruitESP", visual_tab:Toggle({
         Title = "Fruit ESP",
@@ -426,46 +497,41 @@ if WindUI then
         Callback = function(v) settings.notify = v save_config() end,
     }))
 
+    local ui_tab = window:Tab({ Title = "UI", Icon = "settings" })
+    reg("UIHotkey", ui_tab:Dropdown({
+        Title = "UI Hotkey (default RightControl)",
+        Values = {
+            "RightControl", "LeftControl", "RightShift", "RightAlt", "Insert", "Delete",
+            "Home", "End", "PageUp", "PageDown", "F1", "F2", "F3", "F4",
+        },
+        Value = settings.hotkey,
+        Callback = function(opt)
+            settings.hotkey = option_value(opt)
+            apply_hotkey(settings.hotkey)
+            save_config()
+        end,
+    }))
+
     if config then
         pcall(function() config:Load() end)
     end
+    apply_hotkey(settings.hotkey)
 end
 
--- main loop
-join_team()
+-- main loop: every step is protected so one error never stops the farm
+pcall(join_team)
 get_root()
 
 while true do
     if settings.farm then
-        local fruits = find_fruits()
-        if #fruits == 0 then
-            notify("Farm", "No fruits in this server")
-        end
-        for _, fruit in ipairs(fruits) do
-            if not settings.farm then break end
-            if fruit.Parent then
-                pcall(collect_fruit, fruit)
-            end
-        end
+        if player.Team == nil then pcall(join_team) end
+        local ok, err = pcall(farm_server)
+        if not ok then warn("[fruit_hop] farm error: " .. tostring(err)) end
         if settings.farm then
-            hop()
+            local hop_ok, hop_err = pcall(hop)
+            if not hop_ok then warn("[fruit_hop] hop error: " .. tostring(hop_err)) end
         end
     else
         task.wait(1)
     end
 end
-]====]
-
--- re-run this exact script in the next server after every hop
-if queue_on_teleport then
-    queue_on_teleport(SOURCE)
-else
-    warn("[fruit_hop] queue_on_teleport missing: the script will not restart after a hop")
-end
-
-local run, err = loadstring(SOURCE)
-if not run then
-    warn("[fruit_hop] failed to compile: " .. tostring(err))
-    return
-end
-run()
