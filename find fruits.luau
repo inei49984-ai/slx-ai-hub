@@ -28,6 +28,8 @@ local settings = {
     notify = true,
     auto_store = true,
     hotkey = "RightControl",
+    region = "",           -- "" = any region; otherwise a case-insensitive part of the server's region name
+    hop_wait = 0,          -- seconds to wait before each hop
 }
 
 local HOLD_SECONDS = 1     -- time spent touching each fruit
@@ -308,10 +310,13 @@ local function hop()
         local list = fetch_servers(browser)
         if list then
             local cands = {}
+            local region_filter = settings.region ~= "" and settings.region:lower() or nil
             for job, info in pairs(list) do
                 if job ~= my_job and type(info) == "table" then
                     local count = tonumber(info.Count) or math.huge
-                    if count < Players.MaxPlayers then
+                    local region = tostring(info.Region or ""):lower()
+                    local region_ok = region_filter == nil or region:find(region_filter, 1, true) ~= nil
+                    if region_ok and count < Players.MaxPlayers then
                         table.insert(cands, { job = job, count = count })
                     end
                 end
@@ -330,6 +335,16 @@ local function hop()
             notify("Hop", "Server list unavailable")
         end
         task.wait(HOP_DELAY)
+    end
+end
+
+local function wait_before_hop()
+    local seconds = math.floor(settings.hop_wait)
+    if seconds <= 0 then return end
+    notify("Hop", ("Waiting %ds before hopping"):format(seconds))
+    for _ = 1, seconds do
+        if not settings.farm then return end
+        task.wait(1)
     end
 end
 
@@ -508,6 +523,20 @@ if WindUI then
         Callback = function(v) settings.notify = v save_config() end,
     }))
 
+    local hop_tab = window:Tab({ Title = "Server Hop", Icon = "globe" })
+    reg("HopRegion", hop_tab:Input({
+        Title = "Region (blank = any)",
+        Placeholder = "singapore",
+        Value = settings.region,
+        Callback = function(text) settings.region = tostring(text or "") save_config() end,
+    }))
+    reg("HopWait", hop_tab:Slider({
+        Title = "Wait before hop (s)",
+        Value = { Min = 0, Max = 60, Default = settings.hop_wait },
+        Step = 1,
+        Callback = function(v) settings.hop_wait = v save_config() end,
+    }))
+
     local ui_tab = window:Tab({ Title = "UI", Icon = "settings" })
     reg("UIHotkey", ui_tab:Dropdown({
         Title = "UI Hotkey (default RightControl)",
@@ -541,6 +570,9 @@ while true do
         if not ok then
             warn("[fruit_hop] farm error: " .. tostring(err))
             log_line("ERROR farm: " .. tostring(err))
+        end
+        if settings.farm then
+            wait_before_hop()
         end
         if settings.farm then
             local hop_ok, hop_err = pcall(hop)
