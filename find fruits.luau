@@ -44,7 +44,18 @@ if not lib_ok or not WindUI then
     warn("[fruit_hop] WindUI failed to load, running without UI")
 end
 
+-- event log in the executor workspace (FruitHop/log.txt); written even when notifications are off
+local LOG_FILE = "FruitHop/log.txt"
+local function log_line(text)
+    if not (appendfile and writefile) then return end
+    pcall(function()
+        if makefolder and isfolder and not isfolder("FruitHop") then makefolder("FruitHop") end
+        appendfile(LOG_FILE, ("[%s] %s\n"):format(os.date("%H:%M:%S"), tostring(text)))
+    end)
+end
+
 local function notify(title, text)
+    log_line(title .. ": " .. tostring(text))
     if not settings.notify or not WindUI then return end
     pcall(function()
         WindUI:Notify({ Title = title, Content = tostring(text), Duration = 3 })
@@ -519,6 +530,7 @@ if WindUI then
 end
 
 -- main loop: every step is protected so one error never stops the farm
+log_line(("== server %s | fruits on map: %d =="):format(game.JobId, #find_fruits()))
 pcall(join_team)
 get_root()
 
@@ -526,10 +538,16 @@ while true do
     if settings.farm then
         if player.Team == nil then pcall(join_team) end
         local ok, err = pcall(farm_server)
-        if not ok then warn("[fruit_hop] farm error: " .. tostring(err)) end
+        if not ok then
+            warn("[fruit_hop] farm error: " .. tostring(err))
+            log_line("ERROR farm: " .. tostring(err))
+        end
         if settings.farm then
             local hop_ok, hop_err = pcall(hop)
-            if not hop_ok then warn("[fruit_hop] hop error: " .. tostring(hop_err)) end
+            if not hop_ok then
+                warn("[fruit_hop] hop error: " .. tostring(hop_err))
+                log_line("ERROR hop: " .. tostring(hop_err))
+            end
         end
     else
         task.wait(1)
